@@ -16,26 +16,23 @@ use crate::{
         ConfigInputOptions,
     },
     repository::xtream_get_item_for_stream_id,
-    utils::{
-        dedupe_channel_programmes, epg::get_input_raw_epg_file_path, file_exists_async,
-        merge_missing_channel_programmes, ProgrammeMergeKey,
-    },
+    utils::{epg::get_input_raw_epg_file_path, file_exists_async, merge_prioritized_channels},
 };
-use axum::{response::IntoResponse, Router};
+use axum::{
+    response::{IntoResponse, Response},
+    Router,
+};
 use log::{debug, error};
 use serde_json::json;
 use shared::utils::deobfuscate_text;
 use shared::{
     model::{
-        permission::Permission, EpgChannel, InputType, PlaylistEpgRequest, PlaylistRequest,
-        PlaylistUrlResolveRequest, ProxyType, TargetType, UiPlaylistItem, XtreamCluster,
+        permission::Permission, EpgChannel, InputType, PlaylistEpgRequest, PlaylistRequest, PlaylistUrlResolveRequest,
+        ProxyType, TargetType, UiPlaylistItem, XtreamCluster,
     },
     utils::{concat_path_leading_slash, sanitize_sensitive_info, Internable},
 };
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::sync::Arc;
 use url::Url;
 
 fn create_config_input_for_m3u(url: &str) -> ConfigInput {
@@ -126,39 +123,20 @@ fn build_playlist_webplayer_url(
     format!("{base_url}/token/{access_token}/{}/{}/{}", target_id, cluster.as_stream_type(), virtual_id)
 }
 
-struct WebUiChannelAcc {
-    priority: i16,
-    channel: EpgChannel,
-    programmes: HashSet<ProgrammeMergeKey>,
+fn merge_epg_channels(channels_by_source: Vec<(i16, Vec<EpgChannel>)>) -> Vec<EpgChannel> {
+    merge_prioritized_channels(channels_by_source)
 }
 
-fn merge_epg_channels(mut channels_by_source: Vec<(i16, Vec<EpgChannel>)>) -> Vec<EpgChannel> {
-    let mut merged: HashMap<Arc<str>, WebUiChannelAcc> = HashMap::new();
-    channels_by_source.sort_by_key(|(priority, _)| *priority);
-
-    for (priority, channels) in channels_by_source.drain(..) {
-        for mut channel in channels {
-            match merged.entry(channel.id.clone()) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    let acc = entry.get_mut();
-                    debug_assert!(priority >= acc.priority);
-                    merge_missing_channel_programmes(&mut acc.channel, &mut acc.programmes, channel.programmes);
-                }
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let programmes = dedupe_channel_programmes(&mut channel);
-                    entry.insert(WebUiChannelAcc { priority, channel, programmes });
-                }
-            }
-        }
-    }
-
-    for entry in merged.values_mut() {
-        entry.channel.programmes.sort_by_key(|programme| programme.start);
-    }
-
-    let mut channels = merged.into_values().map(|entry| entry.channel).collect::<Vec<_>>();
-    channels.sort_by(|left, right| left.id.cmp(&right.id));
-    channels
+fn respond_with_rewritten_epg(app_state: &Arc<AppState>, accept: Option<&str>, epg: Vec<EpgChannel>) -> Response {
+    let config = app_state.app_config.config.load();
+    let web_ui_path = config.web_ui.as_ref().and_then(|w| w.path.as_ref()).map_or("", String::as_str);
+    let resource_url = concat_path_leading_slash(web_ui_path, "api/v1/playlist/resource");
+    let encrypt_secret = app_state.get_encrypt_secret();
+    let epg = epg
+        .into_iter()
+        .map(|channel| rewrite_epg_channel_resource_url(&encrypt_secret, &resource_url, channel))
+        .collect::<Vec<_>>();
+    json_or_bin_response(accept, &epg).into_response()
 }
 
 async fn load_epg_channels_for_input(
@@ -421,16 +399,7 @@ async fn playlist_epg(
             if let Some(input) = app_state.app_config.get_input_by_name(&input_name.intern()) {
                 match load_epg_channels_for_input(&app_state, input.as_ref()).await {
                     Ok(Some(epg)) => {
-                        let config = app_state.app_config.config.load();
-                        let web_ui_path =
-                            config.web_ui.as_ref().and_then(|w| w.path.as_ref()).map_or("", String::as_str);
-                        let resource_url = concat_path_leading_slash(web_ui_path, "api/v1/playlist/resource");
-                        let encrypt_secret = app_state.get_encrypt_secret();
-                        let epg = epg
-                            .into_iter()
-                            .map(|channel| rewrite_epg_channel_resource_url(&encrypt_secret, &resource_url, channel))
-                            .collect::<Vec<_>>();
-                        return json_or_bin_response(accept.as_deref(), &epg).into_response();
+                        return respond_with_rewritten_epg(&app_state, accept.as_deref(), epg);
                     }
                     Ok(None) => return axum::http::StatusCode::NO_CONTENT.into_response(),
                     Err(err) => {
@@ -451,18 +420,7 @@ async fn playlist_epg(
         PlaylistEpgRequest::Custom(url) => match Url::parse(&url) {
             Ok(parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {
                 match parse_xmltv_for_web_ui_from_url(&app_state, &url).await {
-                    Ok(epg) => {
-                        let config = app_state.app_config.config.load();
-                        let web_ui_path =
-                            config.web_ui.as_ref().and_then(|w| w.path.as_ref()).map_or("", String::as_str);
-                        let resource_url = concat_path_leading_slash(web_ui_path, "api/v1/playlist/resource");
-                        let encrypt_secret = app_state.get_encrypt_secret();
-                        let epg = epg
-                            .into_iter()
-                            .map(|channel| rewrite_epg_channel_resource_url(&encrypt_secret, &resource_url, channel))
-                            .collect::<Vec<_>>();
-                        return json_or_bin_response(accept.as_deref(), &epg).into_response();
-                    }
+                    Ok(epg) => return respond_with_rewritten_epg(&app_state, accept.as_deref(), epg),
                     Err(err) => {
                         error!("Failed to load custom EPG: {}", sanitize_sensitive_info(err.to_string().as_str()));
                         return (

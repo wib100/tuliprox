@@ -5,9 +5,7 @@ use crate::model::{
 use crate::model::{EpgSmartMatchConfig, PersistedEpgSource};
 use crate::processing::processor::EpgIdCache;
 use crate::utils::compressed_file_reader_async::CompressedFileReaderAsync;
-use crate::utils::{
-    async_file_reader, dedupe_channel_programmes, merge_missing_channel_programmes, parse_xmltv_time, ProgrammeMergeKey,
-};
+use crate::utils::{async_file_reader, merge_prioritized_channels, parse_xmltv_time};
 use log::error;
 use quick_xml::events::{BytesStart, BytesText, Event};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -557,62 +555,27 @@ fn collect_tag_attributes(e: &BytesStart, tag_type: XmlTagType) -> HashMap<Arc<s
     attributes
 }
 
-struct ChannelAcc {
-    priority: i16,
-    channel: EpgChannel,
-    programmes: HashSet<ProgrammeMergeKey>,
-}
-
 pub fn flatten_tvguide(mut tv_guides: Vec<Epg>) -> Option<Epg> {
     if tv_guides.is_empty() {
         return None;
     }
 
     let epg_attributes = tv_guides.first().and_then(|t| t.attributes.clone());
-
-    let mut channels: HashMap<Arc<str>, ChannelAcc> = HashMap::new();
+    let mut channels_by_source = Vec::with_capacity(tv_guides.len());
 
     for guide in tv_guides.drain(..) {
+        let mut source_channels = Vec::with_capacity(guide.children.len());
         for channel_arc in guide.children {
-            let Ok(mut channel) = Arc::try_unwrap(channel_arc) else {
+            let Ok(channel) = Arc::try_unwrap(channel_arc) else {
                 error!("Failed to unwrap epg channel");
                 continue;
             };
-            match channels.entry(Arc::clone(&channel.id)) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    let acc = entry.get_mut();
-
-                    if guide.priority < acc.priority {
-                        // Higher-priority sources own channel metadata, but lower-priority
-                        // programmes still fill gaps when the preferred source is incomplete.
-                        let previous_programmes = std::mem::replace(&mut acc.channel, channel).programmes;
-                        acc.priority = guide.priority;
-
-                        acc.programmes = dedupe_channel_programmes(&mut acc.channel);
-                        merge_missing_channel_programmes(&mut acc.channel, &mut acc.programmes, previous_programmes);
-                    } else {
-                        merge_missing_channel_programmes(
-                            &mut acc.channel,
-                            &mut acc.programmes,
-                            channel.programmes.drain(..),
-                        );
-                    }
-                }
-
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    let set = dedupe_channel_programmes(&mut channel);
-
-                    entry.insert(ChannelAcc { priority: guide.priority, channel, programmes: set });
-                }
-            }
+            source_channels.push(channel);
         }
+        channels_by_source.push((guide.priority, source_channels));
     }
 
-    for acc in channels.values_mut() {
-        acc.channel.programmes.sort_by_key(|programme| programme.start);
-    }
-
-    let children = channels.into_values().map(|acc| Arc::new(acc.channel)).collect();
+    let children = merge_prioritized_channels(channels_by_source).into_iter().map(Arc::new).collect();
 
     Some(Epg { logo_override: false, priority: 0, attributes: epg_attributes, children })
 }
