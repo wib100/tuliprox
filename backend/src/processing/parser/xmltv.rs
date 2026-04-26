@@ -159,6 +159,14 @@ impl TVGuide {
         })
     }
 
+    fn channel_icon(tag: &XmlTag) -> Option<Arc<str>> {
+        if let XmlTagIcon::Src(src) = &tag.icon {
+            Some(Arc::clone(src))
+        } else {
+            None
+        }
+    }
+
     fn add_channel_tag(
         id_cache: &mut EpgIdCache,
         source_processed: &mut HashSet<Arc<str>>,
@@ -169,7 +177,7 @@ impl TVGuide {
     ) {
         let tag_epg_id =
             tag.get_attribute_value(&EPG_ATTRIB_ID.intern()).map_or_else(|| "".intern(), Internable::intern);
-        if tag_epg_id.is_empty() || source_processed.contains(&tag_epg_id) {
+        if tag_epg_id.is_empty() {
             return;
         }
 
@@ -180,19 +188,34 @@ impl TVGuide {
             id_cache.channel_epg_id.contains(&tag_epg_id)
         };
 
-        if add_channel && !children.contains_key(&tag_epg_id) {
-            children.insert(
-                Arc::clone(&tag_epg_id),
-                EpgChannel {
-                    id: Arc::clone(&tag_epg_id),
-                    title: Self::channel_display_name(tag),
-                    icon: if let XmlTagIcon::Src(src) = &tag.icon { Some(Arc::clone(src)) } else { None },
-                    programmes: vec![],
-                },
-            );
-            source_processed.insert(Arc::clone(&tag_epg_id));
-            id_cache.processed.insert(tag_epg_id);
+        if !add_channel {
+            return;
         }
+
+        if source_processed.contains(&tag_epg_id) {
+            if let Some(channel) = children.get_mut(&tag_epg_id) {
+                if channel.title.is_none() {
+                    channel.title = Self::channel_display_name(tag);
+                }
+                if channel.icon.is_none() {
+                    channel.icon = Self::channel_icon(tag);
+                }
+            }
+            id_cache.processed.insert(tag_epg_id);
+            return;
+        }
+
+        children.insert(
+            Arc::clone(&tag_epg_id),
+            EpgChannel {
+                id: Arc::clone(&tag_epg_id),
+                title: Self::channel_display_name(tag),
+                icon: Self::channel_icon(tag),
+                programmes: vec![],
+            },
+        );
+        source_processed.insert(Arc::clone(&tag_epg_id));
+        id_cache.processed.insert(tag_epg_id);
     }
 
     fn add_programme_tag(
@@ -807,6 +830,47 @@ mod tests {
             assert_eq!(epgs.len(), 2);
             assert!(id_cache.processed.contains("demo.one"));
             assert!(id_cache.processed.contains("demo.two"));
+        };
+
+        tokio::runtime::Runtime::new().unwrap().block_on(run_test);
+    }
+
+    #[test]
+    fn filter_backfills_metadata_from_duplicate_channel_tags_in_same_source() {
+        let run_test = async move {
+            let dir = tempdir().unwrap();
+            let source = dir.path().join("duplicate-channel.xml");
+
+            fs::write(
+                &source,
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<tv>
+  <channel id="demo.channel">
+    <display-name>Recovered Title</display-name>
+  </channel>
+  <channel id="demo.channel">
+    <icon src="http://example/icon.png"/>
+  </channel>
+  <programme start="20260425000000 +0000" stop="20260425010000 +0000" channel="demo.channel">
+    <title>Show</title>
+  </programme>
+</tv>
+"#,
+            )
+            .unwrap();
+
+            let tv_guide =
+                TVGuide::new(vec![PersistedEpgSource { file_path: source, priority: 0, logo_override: false }]);
+
+            let mut id_cache = EpgIdCache::new(None);
+            id_cache.channel_epg_id.insert("demo.channel".intern());
+
+            let epgs = tv_guide.filter(&mut id_cache).await.expect("filtered epg");
+
+            assert_eq!(epgs.len(), 1);
+            assert_eq!(epgs[0].children.len(), 1);
+            assert_eq!(epgs[0].children[0].title.as_deref(), Some("Recovered Title"));
+            assert_eq!(epgs[0].children[0].icon.as_deref(), Some("http://example/icon.png"));
         };
 
         tokio::runtime::Runtime::new().unwrap().block_on(run_test);

@@ -41,14 +41,20 @@ pub(crate) fn merge_missing_channel_programmes<I>(
 ) where
     I: IntoIterator<Item = EpgProgramme>,
 {
+    let mut programme_index = channel
+        .programmes
+        .iter()
+        .enumerate()
+        .map(|(idx, programme)| (ProgrammeMergeKey::from(programme), idx))
+        .collect::<HashMap<_, _>>();
+
     for mut programme in incoming {
         let key = ProgrammeMergeKey::from(&programme);
         if programmes.insert(key.clone()) {
+            programme_index.insert(key, channel.programmes.len());
             channel.programmes.push(programme);
-        } else if let Some(existing) =
-            channel.programmes.iter_mut().find(|existing| ProgrammeMergeKey::from(&**existing) == key)
-        {
-            backfill_programme_metadata(existing, &mut programme);
+        } else if let Some(existing_idx) = programme_index.get(&key) {
+            backfill_programme_metadata(&mut channel.programmes[*existing_idx], &mut programme);
         }
     }
 }
@@ -69,6 +75,7 @@ pub(crate) fn merge_prioritized_channels(mut channels_by_source: Vec<(i16, Vec<E
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let acc = entry.get_mut();
                     debug_assert!(priority >= acc.priority);
+                    backfill_channel_metadata(&mut acc.channel, &mut channel);
                     merge_missing_channel_programmes(&mut acc.channel, &mut acc.programmes, channel.programmes);
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -94,6 +101,15 @@ fn backfill_programme_metadata(existing: &mut EpgProgramme, incoming: &mut EpgPr
     }
     if existing.desc.is_none() {
         existing.desc = incoming.desc.take();
+    }
+}
+
+fn backfill_channel_metadata(existing: &mut EpgChannel, incoming: &mut EpgChannel) {
+    if existing.title.is_none() {
+        existing.title = incoming.title.take();
+    }
+    if existing.icon.is_none() {
+        existing.icon = incoming.icon.take();
     }
 }
 
@@ -196,6 +212,32 @@ mod tests {
         assert_eq!(
             channels[0].programmes.iter().map(|programme| (programme.start, programme.stop)).collect::<Vec<_>>(),
             vec![(10, 20), (30, 40), (50, 60)],
+        );
+    }
+
+    #[test]
+    fn merge_prioritized_channels_backfills_missing_channel_metadata() {
+        let high_priority = EpgChannel {
+            id: "demo.channel".intern(),
+            title: None,
+            icon: None,
+            programmes: vec![EpgProgramme::new_all(30, 40, "demo.channel".intern(), Some("High Show".intern()), None)],
+        };
+        let low_priority = EpgChannel {
+            id: "demo.channel".intern(),
+            title: Some("Recovered Title".intern()),
+            icon: Some("http://recovered/icon.png".intern()),
+            programmes: vec![EpgProgramme::new_all(50, 60, "demo.channel".intern(), Some("Low Show".intern()), None)],
+        };
+
+        let channels = merge_prioritized_channels(vec![(0, vec![high_priority]), (10, vec![low_priority])]);
+
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].title.as_deref(), Some("Recovered Title"));
+        assert_eq!(channels[0].icon.as_deref(), Some("http://recovered/icon.png"));
+        assert_eq!(
+            channels[0].programmes.iter().map(|programme| (programme.start, programme.stop)).collect::<Vec<_>>(),
+            vec![(30, 40), (50, 60)],
         );
     }
 }
