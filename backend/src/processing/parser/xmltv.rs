@@ -90,13 +90,27 @@ pub fn normalize_channel_name(name: &str, normalize_config: &EpgSmartMatchConfig
 
 impl TVGuide {
     pub fn merge(epgs: Vec<Epg>) -> Option<Epg> {
-        if let Some(first_epg) = epgs.first() {
-            let first_epg_attributes = first_epg.attributes.clone();
-            let merged_children: Vec<Arc<EpgChannel>> = epgs.into_iter().flat_map(|epg| epg.children).collect();
-            Some(Epg { logo_override: false, priority: 0, attributes: first_epg_attributes, children: merged_children })
-        } else {
-            None
+        if epgs.is_empty() {
+            return None;
         }
+
+        let epg_attributes = epgs.iter().min_by_key(|epg| epg.priority).and_then(|epg| epg.attributes.clone());
+
+        let mut channels_by_source = Vec::with_capacity(epgs.len());
+        for epg in epgs {
+            let mut source_channels = Vec::with_capacity(epg.children.len());
+            for channel_arc in epg.children {
+                let Ok(channel) = Arc::try_unwrap(channel_arc) else {
+                    error!("Failed to unwrap epg channel");
+                    continue;
+                };
+                source_channels.push(channel);
+            }
+            channels_by_source.push((epg.priority, source_channels));
+        }
+
+        let children = merge_prioritized_channels(channels_by_source).into_iter().map(Arc::new).collect();
+        Some(Epg { logo_override: false, priority: 0, attributes: epg_attributes, children })
     }
 
     fn prepare_tag(id_cache: &mut EpgIdCache, tag: &mut XmlTag, smart_match: bool) {
@@ -583,7 +597,7 @@ pub fn flatten_tvguide(mut tv_guides: Vec<Epg>) -> Option<Epg> {
         return None;
     }
 
-    let epg_attributes = tv_guides.first().and_then(|t| t.attributes.clone());
+    let epg_attributes = tv_guides.iter().min_by_key(|guide| guide.priority).and_then(|guide| guide.attributes.clone());
     let mut channels_by_source = Vec::with_capacity(tv_guides.len());
 
     for guide in tv_guides.drain(..) {
@@ -608,7 +622,7 @@ mod tests {
     use crate::model::{Epg, EpgSmartMatchConfig, PersistedEpgSource, TVGuide};
     use crate::processing::parser::xmltv::normalize_channel_name;
     use shared::model::{EpgChannel, EpgProgramme};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -667,6 +681,81 @@ mod tests {
         };
 
         let epg = super::flatten_tvguide(vec![low_priority, high_priority]).expect("merged epg");
+        assert_eq!(epg.children.len(), 1);
+        assert_eq!(epg.children[0].title.as_deref(), Some("High"));
+        assert_eq!(epg.children[0].icon.as_deref(), Some("http://high/icon.png"));
+        assert_eq!(
+            epg.children[0].programmes.iter().map(|programme| (programme.start, programme.stop)).collect::<Vec<_>>(),
+            vec![(10, 20), (30, 40)],
+        );
+    }
+
+    #[test]
+    fn flatten_tvguide_uses_attributes_from_highest_priority_source() {
+        let low_priority = Epg {
+            logo_override: false,
+            priority: 10,
+            attributes: Some(HashMap::from([("generator-info-name".intern(), "low".intern())])),
+            children: vec![],
+        };
+        let high_priority = Epg {
+            logo_override: false,
+            priority: 0,
+            attributes: Some(HashMap::from([("generator-info-name".intern(), "high".intern())])),
+            children: vec![],
+        };
+
+        let epg = super::flatten_tvguide(vec![low_priority, high_priority]).expect("merged epg");
+
+        assert_eq!(
+            epg.attributes.as_ref().and_then(|attributes| attributes.get("generator-info-name")).map(AsRef::as_ref),
+            Some("high"),
+        );
+    }
+
+    #[test]
+    fn tvguide_merge_prefers_higher_priority_attributes_and_dedupes_channels() {
+        let low_priority = Epg {
+            logo_override: false,
+            priority: 10,
+            attributes: Some(HashMap::from([("generator-info-name".intern(), "low".intern())])),
+            children: vec![Arc::new(EpgChannel {
+                id: "demo.channel".intern(),
+                title: Some("Low".intern()),
+                icon: None,
+                programmes: vec![EpgProgramme::new_all(
+                    10,
+                    20,
+                    "demo.channel".intern(),
+                    Some("Low Show".intern()),
+                    None,
+                )],
+            })],
+        };
+        let high_priority = Epg {
+            logo_override: false,
+            priority: 0,
+            attributes: Some(HashMap::from([("generator-info-name".intern(), "high".intern())])),
+            children: vec![Arc::new(EpgChannel {
+                id: "demo.channel".intern(),
+                title: Some("High".intern()),
+                icon: Some("http://high/icon.png".intern()),
+                programmes: vec![EpgProgramme::new_all(
+                    30,
+                    40,
+                    "demo.channel".intern(),
+                    Some("High Show".intern()),
+                    None,
+                )],
+            })],
+        };
+
+        let epg = TVGuide::merge(vec![low_priority, high_priority]).expect("merged epg");
+
+        assert_eq!(
+            epg.attributes.as_ref().and_then(|attributes| attributes.get("generator-info-name")).map(AsRef::as_ref),
+            Some("high"),
+        );
         assert_eq!(epg.children.len(), 1);
         assert_eq!(epg.children[0].title.as_deref(), Some("High"));
         assert_eq!(epg.children[0].icon.as_deref(), Some("http://high/icon.png"));
