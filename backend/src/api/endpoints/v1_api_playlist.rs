@@ -171,14 +171,8 @@ fn merge_epg_channels(mut channels_by_source: Vec<(i16, Vec<EpgChannel>)>) -> Ve
             match merged.entry(channel.id.clone()) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let acc = entry.get_mut();
-                    if priority < acc.priority {
-                        let previous_programmes = std::mem::replace(&mut acc.channel, channel).programmes;
-                        acc.priority = priority;
-                        acc.programmes = dedupe_web_ui_programmes(&mut acc.channel);
-                        merge_missing_web_ui_programmes(&mut acc.channel, &mut acc.programmes, previous_programmes);
-                    } else {
-                        merge_missing_web_ui_programmes(&mut acc.channel, &mut acc.programmes, channel.programmes);
-                    }
+                    debug_assert!(priority >= acc.priority);
+                    merge_missing_web_ui_programmes(&mut acc.channel, &mut acc.programmes, channel.programmes);
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let programmes = dedupe_web_ui_programmes(&mut channel);
