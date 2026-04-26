@@ -1,6 +1,6 @@
 use crate::model::{
-    EPG_ATTRIB_CHANNEL, EPG_ATTRIB_ID, EPG_TAG_CHANNEL, EPG_TAG_DISPLAY_NAME, EPG_TAG_ICON, EPG_TAG_PROGRAMME,
-    EPG_TAG_TV, Epg, TVGuide, XmlTag, XmlTagIcon,
+    Epg, TVGuide, XmlTag, XmlTagIcon, EPG_ATTRIB_CHANNEL, EPG_ATTRIB_ID, EPG_TAG_CHANNEL, EPG_TAG_DISPLAY_NAME,
+    EPG_TAG_ICON, EPG_TAG_PROGRAMME, EPG_TAG_TV,
 };
 use crate::model::{EpgSmartMatchConfig, PersistedEpgSource};
 use crate::processing::processor::EpgIdCache;
@@ -11,7 +11,7 @@ use quick_xml::events::{BytesStart, BytesText, Event};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use shared::concat_string;
 use shared::model::{EpgChannel, EpgNamePrefix, EpgProgramme};
-use shared::utils::{CONSTANTS, Internable, deunicode_string};
+use shared::utils::{deunicode_string, Internable, CONSTANTS};
 use std::borrow::Cow;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
@@ -155,10 +155,7 @@ impl TVGuide {
 
     fn channel_display_name(tag: &XmlTag) -> Option<Arc<str>> {
         tag.children.as_ref().and_then(|children| {
-            children
-                .iter()
-                .find(|c| c.name.as_ref() == EPG_TAG_DISPLAY_NAME)
-                .and_then(|c| c.value.clone())
+            children.iter().find(|c| c.name.as_ref() == EPG_TAG_DISPLAY_NAME).and_then(|c| c.value.clone())
         })
     }
 
@@ -236,13 +233,7 @@ impl TVGuide {
             }
         }
 
-        channel.programmes.push(EpgProgramme::new_all(
-            start_time,
-            stop_time,
-            Arc::clone(epg_id),
-            title,
-            desc,
-        ));
+        channel.programmes.push(EpgProgramme::new_all(start_time, stop_time, Arc::clone(epg_id), title, desc));
     }
 
     /// Finds the best fuzzy match for a channel's normalized EPG ID using phonetic encoding and Jaro-Winkler similarity.
@@ -345,36 +336,34 @@ impl TVGuide {
                 let mut tv_attributes: Option<HashMap<Arc<str>, Arc<str>>> = None;
                 let smart_match = id_cache.smart_match_config.enabled;
                 let fuzzy_matching = smart_match && id_cache.smart_match_config.fuzzy_matching;
-                let mut filter_tags = |mut tag: XmlTag| {
-                    match tag.name.as_ref() {
-                        EPG_TAG_CHANNEL => Self::add_channel_tag(
-                            id_cache,
-                            &mut source_processed,
-                            &mut children,
-                            &mut tag,
-                            smart_match,
-                            fuzzy_matching,
-                        ),
-                        EPG_TAG_PROGRAMME => {
-                            if let Some(epg_id) = tag.get_attribute_value(&epg_attrib_channel) {
-                                if source_processed.contains(epg_id) {
-                                    Self::add_programme_tag(
-                                        &mut children,
-                                        &tag,
-                                        epg_id,
-                                        &start_attrib,
-                                        &stop_attrib,
-                                        &tag_title,
-                                        &tag_desc,
-                                    );
-                                }
+                let mut filter_tags = |mut tag: XmlTag| match tag.name.as_ref() {
+                    EPG_TAG_CHANNEL => Self::add_channel_tag(
+                        id_cache,
+                        &mut source_processed,
+                        &mut children,
+                        &mut tag,
+                        smart_match,
+                        fuzzy_matching,
+                    ),
+                    EPG_TAG_PROGRAMME => {
+                        if let Some(epg_id) = tag.get_attribute_value(&epg_attrib_channel) {
+                            if source_processed.contains(epg_id) {
+                                Self::add_programme_tag(
+                                    &mut children,
+                                    &tag,
+                                    epg_id,
+                                    &start_attrib,
+                                    &stop_attrib,
+                                    &tag_title,
+                                    &tag_desc,
+                                );
                             }
                         }
-                        EPG_TAG_TV => {
-                            tv_attributes.clone_from(&tag.attributes);
-                        }
-                        _ => {}
                     }
+                    EPG_TAG_TV => {
+                        tv_attributes.clone_from(&tag.attributes);
+                    }
+                    _ => {}
                 };
 
                 parse_tvguide(&mut reader, &mut filter_tags).await;
@@ -584,6 +573,12 @@ struct ChannelAcc {
     programmes: HashSet<ProgrammeKey>,
 }
 
+fn dedupe_programmes(channel: &mut EpgChannel) -> HashSet<ProgrammeKey> {
+    let mut seen = HashSet::new();
+    channel.programmes.retain(|programme| seen.insert(ProgrammeKey::from(programme)));
+    seen
+}
+
 fn merge_missing_programmes<I>(channel: &mut EpgChannel, programmes: &mut HashSet<ProgrammeKey>, incoming: I)
 where
     I: IntoIterator<Item = EpgProgramme>,
@@ -621,10 +616,7 @@ pub fn flatten_tvguide(mut tv_guides: Vec<Epg>) -> Option<Epg> {
                         let previous_programmes = std::mem::replace(&mut acc.channel, channel).programmes;
                         acc.priority = guide.priority;
 
-                        acc.programmes.clear();
-                        for p in &acc.channel.programmes {
-                            acc.programmes.insert(ProgrammeKey::from(p));
-                        }
+                        acc.programmes = dedupe_programmes(&mut acc.channel);
                         merge_missing_programmes(&mut acc.channel, &mut acc.programmes, previous_programmes);
                     } else {
                         merge_missing_programmes(&mut acc.channel, &mut acc.programmes, channel.programmes.drain(..));
@@ -632,10 +624,7 @@ pub fn flatten_tvguide(mut tv_guides: Vec<Epg>) -> Option<Epg> {
                 }
 
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let mut set = HashSet::new();
-                    for p in &channel.programmes {
-                        set.insert(ProgrammeKey::from(p));
-                    }
+                    let set = dedupe_programmes(&mut channel);
 
                     entry.insert(ChannelAcc { priority: guide.priority, channel, programmes: set });
                 }
@@ -657,8 +646,8 @@ mod tests {
     use crate::model::{Epg, EpgSmartMatchConfig, PersistedEpgSource, TVGuide};
     use crate::processing::parser::xmltv::normalize_channel_name;
     use shared::model::{EpgChannel, EpgProgramme};
-    use std::fs;
     use std::collections::HashSet;
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -726,6 +715,51 @@ mod tests {
     }
 
     #[test]
+    fn flatten_tvguide_dedupes_duplicate_programmes_from_preferred_source() {
+        let high_priority = Epg {
+            logo_override: false,
+            priority: 0,
+            attributes: None,
+            children: vec![Arc::new(EpgChannel {
+                id: "demo.channel".intern(),
+                title: Some("High".intern()),
+                icon: None,
+                programmes: vec![
+                    EpgProgramme::new_all(30, 40, "demo.channel".intern(), Some("High Title".intern()), None),
+                    EpgProgramme::new_all(30, 40, "demo.channel".intern(), Some("Duplicate Title".intern()), None),
+                ],
+            })],
+        };
+        let low_priority = Epg {
+            logo_override: false,
+            priority: 10,
+            attributes: None,
+            children: vec![Arc::new(EpgChannel {
+                id: "demo.channel".intern(),
+                title: Some("Low".intern()),
+                icon: None,
+                programmes: vec![EpgProgramme::new_all(
+                    50,
+                    60,
+                    "demo.channel".intern(),
+                    Some("Low Title".intern()),
+                    None,
+                )],
+            })],
+        };
+
+        let epg = super::flatten_tvguide(vec![high_priority, low_priority]).expect("merged epg");
+
+        assert_eq!(epg.children.len(), 1);
+        assert_eq!(epg.children[0].programmes.len(), 2);
+        assert_eq!(
+            epg.children[0].programmes.iter().map(|programme| (programme.start, programme.stop)).collect::<Vec<_>>(),
+            vec![(30, 40), (50, 60)],
+        );
+        assert_eq!(epg.children[0].programmes[0].title.as_deref(), Some("High Title"));
+    }
+
+    #[test]
     fn filter_keeps_same_channel_id_across_sources_for_flattening() {
         let run_test = async move {
             let dir = tempdir().unwrap();
@@ -776,11 +810,8 @@ mod tests {
 
             assert_eq!(flattened.children.len(), 1);
             assert_eq!(flattened.children[0].programmes.len(), 2);
-            let titles: Vec<_> = flattened.children[0]
-                .programmes
-                .iter()
-                .filter_map(|programme| programme.title.as_deref())
-                .collect();
+            let titles: Vec<_> =
+                flattened.children[0].programmes.iter().filter_map(|programme| programme.title.as_deref()).collect();
             assert_eq!(titles, vec!["Low Source", "High Source"]);
         };
 

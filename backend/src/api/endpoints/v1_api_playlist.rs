@@ -12,8 +12,8 @@ use crate::{
     },
     auth::{create_access_token, permission_layer},
     model::{
-        AppConfig, ConfigInput, ConfigInputFlags, ConfigInputOptions, parse_xmltv_for_web_ui_from_file,
-        parse_xmltv_for_web_ui_from_url,
+        parse_xmltv_for_web_ui_from_file, parse_xmltv_for_web_ui_from_url, AppConfig, ConfigInput, ConfigInputFlags,
+        ConfigInputOptions,
     },
     repository::xtream_get_item_for_stream_id,
     utils::{epg::get_input_raw_epg_file_path, file_exists_async},
@@ -24,10 +24,10 @@ use serde_json::json;
 use shared::utils::deobfuscate_text;
 use shared::{
     model::{
-        EpgChannel, EpgProgramme, InputType, PlaylistEpgRequest, PlaylistRequest, PlaylistUrlResolveRequest, ProxyType,
-        TargetType, UiPlaylistItem, XtreamCluster, permission::Permission,
+        permission::Permission, EpgChannel, EpgProgramme, InputType, PlaylistEpgRequest, PlaylistRequest,
+        PlaylistUrlResolveRequest, ProxyType, TargetType, UiPlaylistItem, XtreamCluster,
     },
-    utils::{Internable, concat_path_leading_slash, sanitize_sensitive_info},
+    utils::{concat_path_leading_slash, sanitize_sensitive_info, Internable},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -141,6 +141,12 @@ struct WebUiChannelAcc {
     programmes: HashSet<WebUiProgrammeKey>,
 }
 
+fn dedupe_web_ui_programmes(channel: &mut EpgChannel) -> HashSet<WebUiProgrammeKey> {
+    let mut seen = HashSet::new();
+    channel.programmes.retain(|programme| seen.insert(WebUiProgrammeKey::from(programme)));
+    seen
+}
+
 fn merge_missing_web_ui_programmes<I>(
     channel: &mut EpgChannel,
     programmes: &mut HashSet<WebUiProgrammeKey>,
@@ -161,22 +167,21 @@ fn merge_epg_channels(mut channels_by_source: Vec<(i16, Vec<EpgChannel>)>) -> Ve
     channels_by_source.sort_by_key(|(priority, _)| *priority);
 
     for (priority, channels) in channels_by_source.drain(..) {
-        for channel in channels {
+        for mut channel in channels {
             match merged.entry(channel.id.clone()) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let acc = entry.get_mut();
                     if priority < acc.priority {
                         let previous_programmes = std::mem::replace(&mut acc.channel, channel).programmes;
                         acc.priority = priority;
-                        acc.programmes =
-                            acc.channel.programmes.iter().map(WebUiProgrammeKey::from).collect::<HashSet<_>>();
+                        acc.programmes = dedupe_web_ui_programmes(&mut acc.channel);
                         merge_missing_web_ui_programmes(&mut acc.channel, &mut acc.programmes, previous_programmes);
                     } else {
                         merge_missing_web_ui_programmes(&mut acc.channel, &mut acc.programmes, channel.programmes);
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let programmes = channel.programmes.iter().map(WebUiProgrammeKey::from).collect::<HashSet<_>>();
+                    let programmes = dedupe_web_ui_programmes(&mut channel);
                     entry.insert(WebUiChannelAcc { priority, channel, programmes });
                 }
             }
@@ -606,14 +611,14 @@ mod tests {
             AppConfig, Config, ConfigInput, ConfigProvider, ConfigSource, ConfigTarget, SourcesConfig,
             StreamHistoryConfig,
         },
-        utils::GeoIp,
         utils::epg::get_input_raw_epg_file_path,
+        utils::GeoIp,
     };
     use arc_swap::{ArcSwap, ArcSwapOption};
     use axum::{
-        Router,
         body::Body,
         http::{Request, StatusCode},
+        Router,
     };
     use chrono::Utc;
     use shared::foundation::Filter;
@@ -992,6 +997,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn merge_epg_channels_dedupes_duplicate_programmes_from_winning_source() {
+        let high_priority = EpgChannel {
+            id: "demo.channel".intern(),
+            title: Some("High".intern()),
+            icon: Some("http://high/icon.png".intern()),
+            programmes: vec![
+                EpgProgramme::new_all(30, 40, "demo.channel".intern(), Some("High Show".intern()), None),
+                EpgProgramme::new_all(30, 40, "demo.channel".intern(), Some("High Show Duplicate".intern()), None),
+            ],
+        };
+        let low_priority = EpgChannel {
+            id: "demo.channel".intern(),
+            title: Some("Low".intern()),
+            icon: Some("http://low/icon.png".intern()),
+            programmes: vec![EpgProgramme::new_all(50, 60, "demo.channel".intern(), Some("Low Show".intern()), None)],
+        };
+
+        let channels = super::merge_epg_channels(vec![(0, vec![high_priority]), (10, vec![low_priority])]);
+
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].programmes.len(), 2);
+        assert_eq!(
+            channels[0].programmes.iter().map(|programme| (programme.start, programme.stop)).collect::<Vec<_>>(),
+            vec![(30, 40), (50, 60)],
+        );
+        assert_eq!(channels[0].programmes[0].title.as_deref(), Some("High Show"));
+    }
+
     #[tokio::test]
     async fn load_epg_channels_for_input_uses_resolved_provider_epg_cache_file() {
         let temp_dir = tempdir().expect("temp dir");
@@ -1329,5 +1363,4 @@ mod tests {
         assert!(body_text.contains("Second Show"), "{body_text}");
         assert!(!body_text.contains("Secondary Show"), "{body_text}");
     }
-
 }
