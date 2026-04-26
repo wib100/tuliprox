@@ -16,7 +16,10 @@ use crate::{
         ConfigInputOptions,
     },
     repository::xtream_get_item_for_stream_id,
-    utils::{epg::get_input_raw_epg_file_path, file_exists_async},
+    utils::{
+        dedupe_channel_programmes, epg::get_input_raw_epg_file_path, file_exists_async,
+        merge_missing_channel_programmes, ProgrammeMergeKey,
+    },
 };
 use axum::{response::IntoResponse, Router};
 use log::{debug, error};
@@ -24,7 +27,7 @@ use serde_json::json;
 use shared::utils::deobfuscate_text;
 use shared::{
     model::{
-        permission::Permission, EpgChannel, EpgProgramme, InputType, PlaylistEpgRequest, PlaylistRequest,
+        permission::Permission, EpgChannel, InputType, PlaylistEpgRequest, PlaylistRequest,
         PlaylistUrlResolveRequest, ProxyType, TargetType, UiPlaylistItem, XtreamCluster,
     },
     utils::{concat_path_leading_slash, sanitize_sensitive_info, Internable},
@@ -123,43 +126,10 @@ fn build_playlist_webplayer_url(
     format!("{base_url}/token/{access_token}/{}/{}/{}", target_id, cluster.as_stream_type(), virtual_id)
 }
 
-#[derive(Hash, Eq, PartialEq)]
-struct WebUiProgrammeKey {
-    start: i64,
-    stop: i64,
-}
-
-impl From<&EpgProgramme> for WebUiProgrammeKey {
-    fn from(programme: &EpgProgramme) -> Self {
-        Self { start: programme.start, stop: programme.stop }
-    }
-}
-
 struct WebUiChannelAcc {
     priority: i16,
     channel: EpgChannel,
-    programmes: HashSet<WebUiProgrammeKey>,
-}
-
-fn dedupe_web_ui_programmes(channel: &mut EpgChannel) -> HashSet<WebUiProgrammeKey> {
-    let mut seen = HashSet::new();
-    channel.programmes.retain(|programme| seen.insert(WebUiProgrammeKey::from(programme)));
-    seen
-}
-
-fn merge_missing_web_ui_programmes<I>(
-    channel: &mut EpgChannel,
-    programmes: &mut HashSet<WebUiProgrammeKey>,
-    incoming: I,
-) where
-    I: IntoIterator<Item = EpgProgramme>,
-{
-    for programme in incoming {
-        let key = WebUiProgrammeKey::from(&programme);
-        if programmes.insert(key) {
-            channel.programmes.push(programme);
-        }
-    }
+    programmes: HashSet<ProgrammeMergeKey>,
 }
 
 fn merge_epg_channels(mut channels_by_source: Vec<(i16, Vec<EpgChannel>)>) -> Vec<EpgChannel> {
@@ -172,10 +142,10 @@ fn merge_epg_channels(mut channels_by_source: Vec<(i16, Vec<EpgChannel>)>) -> Ve
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let acc = entry.get_mut();
                     debug_assert!(priority >= acc.priority);
-                    merge_missing_web_ui_programmes(&mut acc.channel, &mut acc.programmes, channel.programmes);
+                    merge_missing_channel_programmes(&mut acc.channel, &mut acc.programmes, channel.programmes);
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let programmes = dedupe_web_ui_programmes(&mut channel);
+                    let programmes = dedupe_channel_programmes(&mut channel);
                     entry.insert(WebUiChannelAcc { priority, channel, programmes });
                 }
             }
@@ -478,23 +448,35 @@ async fn playlist_epg(
                 }
             }
         }
-        PlaylistEpgRequest::Custom(url) => match parse_xmltv_for_web_ui_from_url(&app_state, &url).await {
-            Ok(epg) => {
-                let config = app_state.app_config.config.load();
-                let web_ui_path = config.web_ui.as_ref().and_then(|w| w.path.as_ref()).map_or("", String::as_str);
-                let resource_url = concat_path_leading_slash(web_ui_path, "api/v1/playlist/resource");
-                let encrypt_secret = app_state.get_encrypt_secret();
-                let epg = epg
-                    .into_iter()
-                    .map(|channel| rewrite_epg_channel_resource_url(&encrypt_secret, &resource_url, channel))
-                    .collect::<Vec<_>>();
-                return json_or_bin_response(accept.as_deref(), &epg).into_response();
+        PlaylistEpgRequest::Custom(url) => match Url::parse(&url) {
+            Ok(parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {
+                match parse_xmltv_for_web_ui_from_url(&app_state, &url).await {
+                    Ok(epg) => {
+                        let config = app_state.app_config.config.load();
+                        let web_ui_path =
+                            config.web_ui.as_ref().and_then(|w| w.path.as_ref()).map_or("", String::as_str);
+                        let resource_url = concat_path_leading_slash(web_ui_path, "api/v1/playlist/resource");
+                        let encrypt_secret = app_state.get_encrypt_secret();
+                        let epg = epg
+                            .into_iter()
+                            .map(|channel| rewrite_epg_channel_resource_url(&encrypt_secret, &resource_url, channel))
+                            .collect::<Vec<_>>();
+                        return json_or_bin_response(accept.as_deref(), &epg).into_response();
+                    }
+                    Err(err) => {
+                        error!("Failed to load custom EPG: {}", sanitize_sensitive_info(err.to_string().as_str()));
+                        return (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(serde_json::json!({"error": "Failed to load EPG"})),
+                        )
+                            .into_response();
+                    }
+                }
             }
-            Err(err) => {
-                error!("Failed to load custom EPG: {}", sanitize_sensitive_info(err.to_string().as_str()));
+            _ => {
                 return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    axum::Json(serde_json::json!({"error": "Failed to load EPG"})),
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(json!({"error": "Invalid url scheme; only http/https are allowed"})),
                 )
                     .into_response();
             }
@@ -1018,6 +1000,38 @@ mod tests {
             vec![(30, 40), (50, 60)],
         );
         assert_eq!(channels[0].programmes[0].title.as_deref(), Some("High Show"));
+    }
+
+    #[tokio::test]
+    async fn playlist_epg_custom_route_rejects_invalid_url_scheme() {
+        let provider = ConfigProvider::from(&ConfigProviderDto {
+            name: "demo".intern(),
+            urls: vec!["http://provider.example".intern()],
+            provider_url_selection_policy: shared::model::ProviderUrlSelectionPolicy::default(),
+            dns: None,
+        });
+        let input = Arc::new(ConfigInput {
+            id: 7,
+            name: "input".intern(),
+            provider_configs: Some(vec![Arc::new(provider)]),
+            ..Default::default()
+        });
+        let source = ConfigSource { inputs: vec![Arc::clone(&input.name)], targets: vec![] };
+        let app_state = test_app_state(Arc::new(test_app_config(input, source)));
+        let router = super::v1_api_playlist_register_protected(Router::new()).with_state(app_state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/playlist/epg")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"Custom":"file:///tmp/epg.xml"}"#))
+            .expect("request");
+
+        let response = router.into_service::<Body>().oneshot(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let body_text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(body_text.contains("Invalid url scheme"), "{body_text}");
     }
 
     #[tokio::test]

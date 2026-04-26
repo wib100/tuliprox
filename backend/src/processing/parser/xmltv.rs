@@ -5,7 +5,9 @@ use crate::model::{
 use crate::model::{EpgSmartMatchConfig, PersistedEpgSource};
 use crate::processing::processor::EpgIdCache;
 use crate::utils::compressed_file_reader_async::CompressedFileReaderAsync;
-use crate::utils::{async_file_reader, parse_xmltv_time};
+use crate::utils::{
+    async_file_reader, dedupe_channel_programmes, merge_missing_channel_programmes, parse_xmltv_time, ProgrammeMergeKey,
+};
 use log::error;
 use quick_xml::events::{BytesStart, BytesText, Event};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -555,40 +557,10 @@ fn collect_tag_attributes(e: &BytesStart, tag_type: XmlTagType) -> HashMap<Arc<s
     attributes
 }
 
-#[derive(Hash, Eq, PartialEq)]
-struct ProgrammeKey {
-    start: i64,
-    stop: i64,
-}
-
-impl From<&EpgProgramme> for ProgrammeKey {
-    fn from(p: &EpgProgramme) -> Self {
-        Self { start: p.start, stop: p.stop }
-    }
-}
-
 struct ChannelAcc {
     priority: i16,
     channel: EpgChannel,
-    programmes: HashSet<ProgrammeKey>,
-}
-
-fn dedupe_programmes(channel: &mut EpgChannel) -> HashSet<ProgrammeKey> {
-    let mut seen = HashSet::new();
-    channel.programmes.retain(|programme| seen.insert(ProgrammeKey::from(programme)));
-    seen
-}
-
-fn merge_missing_programmes<I>(channel: &mut EpgChannel, programmes: &mut HashSet<ProgrammeKey>, incoming: I)
-where
-    I: IntoIterator<Item = EpgProgramme>,
-{
-    for programme in incoming {
-        let key = ProgrammeKey::from(&programme);
-        if programmes.insert(key) {
-            channel.programmes.push(programme);
-        }
-    }
+    programmes: HashSet<ProgrammeMergeKey>,
 }
 
 pub fn flatten_tvguide(mut tv_guides: Vec<Epg>) -> Option<Epg> {
@@ -616,15 +588,19 @@ pub fn flatten_tvguide(mut tv_guides: Vec<Epg>) -> Option<Epg> {
                         let previous_programmes = std::mem::replace(&mut acc.channel, channel).programmes;
                         acc.priority = guide.priority;
 
-                        acc.programmes = dedupe_programmes(&mut acc.channel);
-                        merge_missing_programmes(&mut acc.channel, &mut acc.programmes, previous_programmes);
+                        acc.programmes = dedupe_channel_programmes(&mut acc.channel);
+                        merge_missing_channel_programmes(&mut acc.channel, &mut acc.programmes, previous_programmes);
                     } else {
-                        merge_missing_programmes(&mut acc.channel, &mut acc.programmes, channel.programmes.drain(..));
+                        merge_missing_channel_programmes(
+                            &mut acc.channel,
+                            &mut acc.programmes,
+                            channel.programmes.drain(..),
+                        );
                     }
                 }
 
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let set = dedupe_programmes(&mut channel);
+                    let set = dedupe_channel_programmes(&mut channel);
 
                     entry.insert(ChannelAcc { priority: guide.priority, channel, programmes: set });
                 }
